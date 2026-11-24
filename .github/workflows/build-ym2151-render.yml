@@ -1,0 +1,71 @@
+name: Build standalone YM2151 renderer (Linux x86_64)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Build ymfm renderer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/aaronsgiles/ymfm.git ymfm
+          mkdir -p output
+          git -C ymfm rev-parse HEAD > output/ymfm_commit.txt
+          cat > ym2151_render.cpp <<'CPP'
+          #include "ymfm_opm.h"
+          #include <algorithm>
+          #include <cstdint>
+          #include <fstream>
+          #include <iostream>
+          #include <stdexcept>
+          #include <vector>
+          // stdin: total number of frames, then zero-based native frame index, register and value (decimal).
+          // stdout: signed little-endian 16-bit stereo raw PCM, 62500 Hz at 4 MHz.
+          struct Event { uint64_t t; unsigned reg, val; };
+          struct Host : ymfm::ymfm_interface {};
+          int main() {
+              uint64_t frames; if (!(std::cin >> frames) || frames == 0) return 2;
+              std::vector<Event> ev; Event e;
+              while (std::cin >> e.t >> e.reg >> e.val) {
+                  if (e.t >= frames || e.reg > 255 || e.val > 255 || (!ev.empty() && e.t < ev.back().t)) return 3;
+                  ev.push_back(e);
+              }
+              Host host; ymfm::ym2151 chip(host); chip.reset();
+              if (chip.sample_rate(4000000) != 62500) return 4;
+              size_t i=0; ymfm::ym2151::output_data out;
+              for (uint64_t t=0; t<frames; ++t) {
+                  while (i<ev.size() && ev[i].t==t) {chip.write_address(ev[i].reg);chip.write_data(ev[i].val);++i;}
+                  chip.generate(&out,1);
+                  for (unsigned c=0;c<2;++c) {
+                      uint16_t v=static_cast<uint16_t>(static_cast<int16_t>(std::clamp<int32_t>(out.data[c],-32768,32767)));
+                      char b[2]={static_cast<char>(v&255),static_cast<char>(v>>8)};std::cout.write(b,2);
+                  }
+              }
+              return std::cout.good()?0:5;
+          }
+          CPP
+          g++ -std=c++17 -O3 -DNDEBUG -Iymfm/src ym2151_render.cpp ymfm/src/ymfm_opm.cpp -o output/ym2151_render
+          cp ym2151_render.cpp output/
+          cp -r ymfm/src output/ymfm_src
+          cp ymfm/LICENSE output/ymfm_LICENSE
+          python3 - <<'PYTEST'
+          import subprocess,struct
+          regs={0x20:0xc7,0x28:0x4a,0x30:0,0x38:0}
+          for op in range(4):
+              for b,v in [(0x40,1),(0x60,24),(0x80,31),(0xa0,0),(0xc0,0),(0xe0,7)]:
+                  regs[b+op*8]=v
+          text='62500\n'+''.join(f'0 {r} {v}\n' for r,v in regs.items())+'100 8 120\n31250 8 0\n'
+          data=subprocess.check_output(['output/ym2151_render'],input=text.encode())
+          assert len(data)==62500*4
+          assert max(abs(x[0]) for x in struct.iter_unpack('<h',data))>0
+          print('YM2151 renderer nonzero PCM smoke test passed')
+          PYTEST
+          sha256sum output/ym2151_render > output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ym2151-render-linux-x86_64
+          path: output/
+          if-no-files-found: error
